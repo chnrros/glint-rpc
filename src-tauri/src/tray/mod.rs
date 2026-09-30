@@ -128,20 +128,35 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             let Some(preset_id) = id.strip_prefix("preset:") else {
                 return;
             };
-            let Some(commands) = state.primary_command_sender() else {
+            let excluded = state
+                .excluded_clients
+                .lock()
+                .expect("excluded clients mutex poisoned")
+                .clone();
+            let targets = state.command_senders_excluding(&excluded);
+            if targets.is_empty() {
                 return;
-            };
+            }
             let presets = state
                 .tray_presets
                 .lock()
                 .expect("tray presets mutex poisoned");
             if let Some(preset) = presets.iter().find(|p| p.id == preset_id) {
-                let (reply_tx, _reply_rx) = mpsc::channel();
-                let _ = commands.send(ConnectionCommand::SetApplicationId(preset.app_id.clone()));
-                let _ = commands.send(ConnectionCommand::SetActivity(
-                    Box::new(preset.payload.clone()),
-                    reply_tx,
-                ));
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[glint {}] tray preset click, excluding {excluded:?}, {} target(s)",
+                    crate::ipc::log_ts(),
+                    targets.len()
+                );
+                for commands in &targets {
+                    let (reply_tx, _reply_rx) = mpsc::channel();
+                    let _ =
+                        commands.send(ConnectionCommand::SetApplicationId(preset.app_id.clone()));
+                    let _ = commands.send(ConnectionCommand::SetActivity(
+                        Box::new(preset.payload.clone()),
+                        reply_tx,
+                    ));
+                }
             }
         }
     }

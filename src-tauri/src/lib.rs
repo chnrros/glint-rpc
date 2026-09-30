@@ -67,6 +67,7 @@ pub fn run() {
             commands::set_application_id,
             commands::sync_tray_presets,
             commands::set_minimize_to_tray_on_close,
+            commands::sync_excluded_clients,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -3,7 +3,7 @@ import { SectionCard } from "../../components/SectionCard";
 import { clearActivity } from "../../lib/commands";
 import { STATUS_DOT } from "../../lib/connectionStatus";
 import { applyPresetToClient } from "../../lib/applyPresetToClient";
-import { NONE_ASSIGNMENT, useClientAssignments } from "./useClientAssignments";
+import { NONE_ASSIGNMENT, type useClientAssignments } from "./useClientAssignments";
 import type { ClientStatus } from "../../types/connection";
 import type { ApplicationProfile } from "../../types/profile";
 import type { Preset } from "../../types/preset";
@@ -31,6 +31,13 @@ interface ClientsPanelProps {
   clients: ClientStatus[];
   presets: Preset[];
   profiles: ApplicationProfile[];
+  // Passed down from App rather than created here with its own
+  // useClientAssignments() call, so this panel and the editor's
+  // Start/Update read and write the exact same in-memory state. Two
+  // separate hook instances would each keep their own copy, so a change
+  // made here would never be seen by the other until a full reload, which
+  // was the root cause of a None client still receiving Start/Update.
+  assignmentsApi: ReturnType<typeof useClientAssignments>;
 }
 
 /** Lists every locally detected Discord client and lets a preset be applied
@@ -41,8 +48,7 @@ interface ClientsPanelProps {
  * Each connected client's choice (a preset, or "None" to keep it cleared)
  * is remembered by its username and applies from then on: Apply to all and
  * rotation both skip a client set to None. */
-export function ClientsPanel({ clients, presets, profiles }: ClientsPanelProps) {
-  const assignmentsApi = useClientAssignments();
+export function ClientsPanel({ clients, presets, profiles, assignmentsApi }: ClientsPanelProps) {
   const [allPresetId, setAllPresetId] = useState(presets[0]?.id ?? "");
   const [error, setError] = useState<string | null>(null);
 
@@ -88,6 +94,12 @@ export function ClientsPanel({ clients, presets, profiles }: ClientsPanelProps) 
     const targets = clients.filter(
       (client) => client.state === "connected" && assignmentsApi.assignmentFor(usernameOf(client)) !== NONE_ASSIGNMENT,
     );
+    if (import.meta.env.DEV) {
+      console.debug(
+        "[glint] Apply to all targets:",
+        targets.map((c) => c.id),
+      );
+    }
     try {
       await Promise.all(targets.map((client) => applyPresetToClient(client.id, preset, profiles)));
     } catch (err) {

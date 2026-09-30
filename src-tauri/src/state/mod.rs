@@ -103,6 +103,11 @@ pub struct AppState {
     /// of quitting. Defaults to true, matching "closing the window hides
     /// it to the tray"; the Settings toggle can turn it off.
     pub minimize_to_tray: Arc<Mutex<bool>>,
+    /// Clients the frontend has set to None. Rust has no concept of that
+    /// assignment itself (it lives only in the frontend's store), so this
+    /// is synced over whenever it changes, purely so the tray's own preset
+    /// clicks can skip the same clients Start/Update does.
+    pub excluded_clients: Arc<Mutex<Vec<ClientId>>>,
 }
 
 impl AppState {
@@ -117,6 +122,7 @@ impl AppState {
             clients,
             tray_presets: Arc::new(Mutex::new(Vec::new())),
             minimize_to_tray: Arc::new(Mutex::new(true)),
+            excluded_clients: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -147,26 +153,31 @@ impl AppState {
             .map(|handle| handle.commands.clone())
     }
 
-    /// The sender for the lowest numbered known client, used by the tray
-    /// menu, which has no concept of picking a specific client.
-    pub(crate) fn primary_command_sender(&self) -> Option<Sender<ConnectionCommand>> {
-        let clients = self.clients.lock().expect("clients mutex poisoned");
-        clients
-            .keys()
-            .min()
-            .and_then(|id| clients.get(id))
-            .map(|handle| handle.commands.clone())
-    }
-
     /// Every currently known client's command sender, used to clear every
-    /// client at once (the tray's "Stop presence" item), rather than just
-    /// the primary one.
+    /// client at once (the tray's "Stop presence" item).
     pub(crate) fn all_command_senders(&self) -> Vec<Sender<ConnectionCommand>> {
         self.clients
             .lock()
             .expect("clients mutex poisoned")
             .values()
             .map(|handle| handle.commands.clone())
+            .collect()
+    }
+
+    /// Every currently known client's command sender, except the ones
+    /// listed in `excluded`. Used by the tray's preset clicks, so a client
+    /// the frontend has set to None doesn't get a preset pushed to it
+    /// from there either.
+    pub(crate) fn command_senders_excluding(
+        &self,
+        excluded: &[ClientId],
+    ) -> Vec<Sender<ConnectionCommand>> {
+        self.clients
+            .lock()
+            .expect("clients mutex poisoned")
+            .iter()
+            .filter(|(id, _)| !excluded.contains(id))
+            .map(|(_, handle)| handle.commands.clone())
             .collect()
     }
 

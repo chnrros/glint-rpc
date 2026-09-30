@@ -30,6 +30,10 @@ export function syncTrayPresets(presets: TrayPreset[]): Promise<void> {
   return invoke("sync_tray_presets", { presets });
 }
 
+export function syncExcludedClients(clientIds: number[]): Promise<void> {
+  return invoke("sync_excluded_clients", { clientIds });
+}
+
 export function setMinimizeToTrayOnClose(enabled: boolean): Promise<void> {
   return invoke("set_minimize_to_tray_on_close", { enabled });
 }

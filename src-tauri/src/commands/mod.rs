@@ -64,6 +64,17 @@ pub fn set_minimize_to_tray_on_close(state: State<AppState>, enabled: bool) {
         .expect("minimize_to_tray mutex poisoned") = enabled;
 }
 
+/// Replaces the set of clients the frontend has set to None. Called
+/// whenever that changes, so the tray's own preset clicks skip the same
+/// clients Start/Update does; see `tray::handle_menu_event`.
+#[tauri::command]
+pub fn sync_excluded_clients(state: State<AppState>, client_ids: Vec<ClientId>) {
+    *state
+        .excluded_clients
+        .lock()
+        .expect("excluded clients mutex poisoned") = client_ids;
+}
+
 /// Sends a `ConnectionCommand` to one client's worker, carrying a one-shot
 /// reply channel, and blocks for its actual result, instead of firing into
 /// the channel and assuming success.

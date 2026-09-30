@@ -6,6 +6,7 @@ import {
   getClients,
   setApplicationId,
   setMinimizeToTrayOnClose,
+  syncExcludedClients,
   syncTrayPresets,
 } from "./lib/commands";
 import { applyPresetToClient } from "./lib/applyPresetToClient";
@@ -51,7 +52,7 @@ function App() {
   );
   const connectedCount = clients.filter((c) => c.state === "connected").length;
   const pillState = connectedCount > 0 ? "connected" : clients.some((c) => c.state === "connecting") ? "connecting" : "disconnected";
-  const pillLabel = connectedCount >= 2 ? `Connected to ${connectedCount} Clients` : STATUS_LABEL[pillState];
+  const pillLabel = connectedCount >= 2 ? `Connected · ${connectedCount} Clients` : STATUS_LABEL[pillState];
   const [tab, setTab] = useState<Tab>("editor");
   const [draft, setDraft] = useState<PresencePayload>(EMPTY_PRESENCE);
   const [applied, setApplied] = useState<PresencePayload | null>(null);
@@ -101,6 +102,12 @@ function App() {
   const applyPreset = useCallback(
     async (preset: Preset) => {
       const targets = clients.filter((c) => c.state === "connected" && !isExcluded(c, assignmentsApi.assignments));
+      if (import.meta.env.DEV) {
+        console.debug(
+          "[glint] Rotation targets:",
+          targets.map((c) => c.id),
+        );
+      }
       await Promise.allSettled(targets.map((c) => applyPresetToClient(c.id, preset, profilesApi.profiles)));
     },
     [clients, assignmentsApi.assignments, profilesApi.profiles],
@@ -115,6 +122,12 @@ function App() {
 
   async function handleStart() {
     if (pending || applicableClients.length === 0) return;
+    if (import.meta.env.DEV) {
+      console.debug(
+        "[glint] Start/Update targets:",
+        applicableClients.map((c) => c.id),
+      );
+    }
     setPending(true);
     setError(null);
     try {
@@ -167,6 +180,15 @@ function App() {
   useEffect(() => {
     void setMinimizeToTrayOnClose(settingsApi.settings.minimizeToTrayOnClose);
   }, [settingsApi.settings.minimizeToTrayOnClose]);
+
+  // Keep Rust's excluded client list in sync, so the tray's own preset
+  // clicks skip a client set to None the same way Start/Update does. Rust
+  // has no other way to know about None: the assignment itself lives only
+  // in the frontend's store.
+  useEffect(() => {
+    const excluded = clients.filter((c) => isExcluded(c, assignmentsApi.assignments)).map((c) => c.id);
+    void syncExcludedClients(excluded);
+  }, [clients, assignmentsApi.assignments]);
 
   // Apply the first saved preset once, as soon as Discord connects, if the
   // user opted in.
@@ -263,6 +285,7 @@ function App() {
               presetsApi={presetsApi}
               rotationApi={rotationApi}
               clients={clients}
+              assignmentsApi={assignmentsApi}
               draft={draft}
               activeProfileId={activeProfileId}
               onLoadPreset={handleLoadPreset}
