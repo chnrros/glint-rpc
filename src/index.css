@@ -1,0 +1,103 @@
+@import "tailwindcss";
+@import "@fontsource-variable/archivo/wdth.css";
+
+/* Manual light/dark theme, toggled by data-theme on <html> (see Settings).
+   Dark is the default look (unprefixed classes); `light:` only overrides
+   what actually needs to change for a legible light surface. */
+@custom-variant light (&:where([data-theme="light"], [data-theme="light"] *));
+
+html {
+  color-scheme: dark;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+}
+
+/* ---- Tunable background + panel variables ----
+   Tweak these to adjust the look without touching any component. */
+:root {
+  /* Background base colour behind the glows (near-black in dark mode). */
+  --bg-base: #07060b;
+  /* Glow colours: indigo/violet only, per design. */
+  --glow-color-1: #6366f1; /* top-left glow */
+  --glow-color-2: #4f46e5; /* bottom-right glow */
+  /* Glow strength: raise for more visible glow, lower to fade it out. */
+  --glow-opacity: 0.55;
+  /* Grain strength: raise for coarser/more visible noise, 0 to disable. */
+  --grain-opacity: 0.08;
+  /* Wordmark fill gradient, top to bottom. */
+  --wordmark-from: #ffffff;
+  --wordmark-to: #818cf8;
+  /* Shared panel/card/input styling. */
+  --panel-radius: 5px;
+  --panel-border: rgba(165, 158, 255, 0.22);
+}
+
+html[data-theme="light"] {
+  --bg-base: #f8f8fb;
+  --glow-color-1: #818cf8;
+  --glow-color-2: #6366f1;
+  --glow-opacity: 0.28;
+  --grain-opacity: 0.035;
+  --wordmark-from: #17151f;
+  --wordmark-to: #4f46e5;
+  --panel-border: rgba(79, 70, 229, 0.3);
+}
+
+body {
+  background: var(--bg-base);
+}
+
+/* Soft blurred indigo/violet glows, fixed behind all content. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+  background:
+    radial-gradient(60vw 60vw at 8% -5%, color-mix(in srgb, var(--glow-color-1) calc(var(--glow-opacity) * 100%), transparent), transparent 65%),
+    radial-gradient(65vw 65vw at 100% 110%, color-mix(in srgb, var(--glow-color-2) calc(var(--glow-opacity) * 100%), transparent), transparent 65%),
+    var(--bg-base);
+  filter: blur(60px);
+}
+
+/* Fine film grain, part of the background layer, not an overlay. Sits
+   behind normal-flow content (z-index -1, between the glow at -2 and the
+   sidebar/panels/text, which paint above any negative-z-index sibling).
+   The tile itself is a canvas-rasterized noise PNG, installed as
+   --grain-image by src/lib/grain.ts on startup: WKWebView (macOS Tauri's
+   webview) doesn't reliably rasterize SVG feTurbulence referenced from a
+   CSS background-image data URI, so an actual raster image sidesteps
+   that gap. mix-blend-mode: soft-light blends it with the glow/base
+   beneath it (not with the UI on top), so the grain reads as indigo over
+   the glow and near-black over the base instead of grey speckles. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: var(--grain-opacity);
+  mix-blend-mode: soft-light;
+  background-image: var(--grain-image, none);
+  background-size: var(--grain-size, 128px) var(--grain-size, 128px);
+  background-repeat: repeat;
+}
+
+.font-wordmark {
+  font-family: "Archivo Variable", ui-sans-serif, system-ui, sans-serif;
+  font-weight: 900;
+  font-stretch: 122%;
+  background-image: linear-gradient(to bottom, var(--wordmark-from), var(--wordmark-to));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  transition: filter 200ms ease;
+}
+
+.font-wordmark:hover {
+  filter: drop-shadow(0 0 8px color-mix(in srgb, var(--wordmark-to) 65%, transparent));
+}
