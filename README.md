@@ -59,12 +59,24 @@ Click **More info**, then **Run anyway**. Windows shows this for any app
 from a developer who hasn't paid for a code-signing certificate. It
 doesn't mean anything is wrong with Glint specifically.
 
-### macOS: "Apple could not verify... is free of malware" / "unidentified developer"
+### macOS: "unidentified developer" or "Glint is damaged and can't be opened"
 
-**Right-click** (or Control-click) the Glint app → **Open** → **Open**
-again in the dialog that appears. You only need to do this once. This
-happens because Glint isn't notarized by Apple, which costs a paid
-developer account. Again, not a sign anything is wrong.
+First try **System Settings → Privacy & Security**, scroll down, and click
+**Open Anyway** next to the message about Glint. You only need to do this
+once. This happens because Glint isn't notarized by Apple, which costs a
+paid developer account. Not a sign anything is wrong.
+
+If macOS still says Glint is damaged after that, open Terminal and run:
+
+```bash
+xattr -cr /Applications/Glint.app
+```
+
+This clears the quarantine flag macOS puts on anything downloaded from
+the internet. It's needed because Glint's builds are ad-hoc signed rather
+than signed with a paid Apple Developer certificate, which macOS
+sometimes reports as "damaged" instead of the usual unidentified
+developer warning.
 
 ### Why it's safe
 
