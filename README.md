@@ -5,7 +5,7 @@ Presence (the activity card on your profile), with a live preview, saved
 presets, rotation, and a system tray icon. No Discord account token, no
 tracking, everything stays on your machine.
 
-<img width="1024" height="612" alt="image" src="https://github.com/user-attachments/assets/fd602a52-7c8d-4710-9f3f-b48f40296fcb" />
+<img width="1175" height="706" alt="Screenshot 2026-10-01 at 9 28 47 am" src="https://github.com/user-attachments/assets/da249794-a58f-434c-848e-98e528888562" />
 
 <img width="1190" height="706" alt="Screenshot 2026-10-01 at 9 27 49 am" src="https://github.com/user-attachments/assets/05e4fc45-b042-4127-a259-cb953d2b8789" />
 
