@@ -116,11 +116,12 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         "quit" => app.exit(0),
         "stop" => {
-            let Some(commands) = state.primary_command_sender() else {
-                return;
-            };
-            let (reply_tx, _reply_rx) = mpsc::channel();
-            let _ = commands.send(ConnectionCommand::ClearActivity(reply_tx));
+            // Clears every connected client, not just the primary one, so
+            // "Stop presence" always means nothing is showing anywhere.
+            for commands in state.all_command_senders() {
+                let (reply_tx, _reply_rx) = mpsc::channel();
+                let _ = commands.send(ConnectionCommand::ClearActivity(reply_tx));
+            }
         }
         "no_presets" => {}
         id => {

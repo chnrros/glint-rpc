@@ -8,6 +8,7 @@ import {
   setMinimizeToTrayOnClose,
   syncTrayPresets,
 } from "./lib/commands";
+import { applyPresetToClient } from "./lib/applyPresetToClient";
 import { STATUS_DOT, STATUS_LABEL } from "./lib/connectionStatus";
 import { EditorView } from "./features/editor/EditorView";
 import { PresetsView } from "./features/presets/PresetsView";
@@ -18,24 +19,39 @@ import { usePresets } from "./features/presets/usePresets";
 import { useRotation } from "./features/rotation/useRotation";
 import { useSettings } from "./features/settings/useSettings";
 import { useTheme } from "./hooks/useTheme";
+import { NONE_ASSIGNMENT, useClientAssignments } from "./features/clients/useClientAssignments";
 import { Sidebar, type Tab } from "./components/Sidebar";
 import { EMPTY_PRESENCE, type PresencePayload } from "./types/presence";
 import { DEFAULT_PROFILE } from "./types/profile";
+import type { ClientStatus } from "./types/connection";
 import type { Preset } from "./types/preset";
 import { hasErrors, validatePresence } from "./lib/validation";
 
 const APP_NAME = "Glint";
 const PROFILE_SWITCH_TIMEOUT_MS = 8000;
 
+function isExcluded(client: ClientStatus, assignments: Record<string, string>): boolean {
+  if (client.state !== "connected" || !client.username) return false;
+  return assignments[client.username] === NONE_ASSIGNMENT;
+}
+
 function App() {
   const clients = useClients();
-  // The editor's own Start/Update/Stop always targets the first detected
-  // Discord client, same as Glint did back when it only supported one.
-  // Additional clients are handled by the Clients panel on the Presets
-  // tab, which applies a preset to a specific client (or all of them)
-  // directly, instead of going through this shared draft.
+  const assignmentsApi = useClientAssignments();
+  // Preset loading and the auto-start-on-launch preset still target a
+  // single "primary" client: the first detected one. Broadcasting a saved
+  // preset's own Application Profile to several independently-configured
+  // clients is what the Clients panel and rotation are for.
   const primaryClientId = clients[0]?.id ?? 0;
   const primaryStatus = clients.find((c) => c.id === primaryClientId);
+  // Every connected client that isn't set to None, i.e. every client the
+  // editor's own Start/Update and rotation are allowed to touch.
+  const applicableClients = clients.filter(
+    (c) => c.state === "connected" && !isExcluded(c, assignmentsApi.assignments),
+  );
+  const connectedCount = clients.filter((c) => c.state === "connected").length;
+  const pillState = connectedCount > 0 ? "connected" : clients.some((c) => c.state === "connecting") ? "connecting" : "disconnected";
+  const pillLabel = connectedCount >= 2 ? `Connected to ${connectedCount} Clients` : STATUS_LABEL[pillState];
   const [tab, setTab] = useState<Tab>("editor");
   const [draft, setDraft] = useState<PresencePayload>(EMPTY_PRESENCE);
   const [applied, setApplied] = useState<PresencePayload | null>(null);
@@ -55,10 +71,11 @@ function App() {
   const errors = validatePresence(draft);
   const isActive = applied !== null;
   const unsaved = isActive && JSON.stringify(draft) !== JSON.stringify(applied);
-  const canApply = primaryStatus?.state === "connected" && !hasErrors(errors);
+  const canApply = applicableClients.length > 0 && !hasErrors(errors);
 
   /** Switches the primary client's connection to `profileId`'s Application
-   * ID and waits for it to reconnect, if it isn't already the active one. */
+   * ID and waits for it to reconnect, if it isn't already the active one.
+   * Used for loading a preset into the editor, not for broadcasting one. */
   const switchProfile = useCallback(
     async (profileId: string) => {
       if (profileId === activeProfileId) return;
@@ -78,12 +95,15 @@ function App() {
     [activeProfileId, primaryClientId, profilesApi.profiles],
   );
 
+  // Rotation broadcasts each tick's preset to every applicable client,
+  // switching each one to that preset's own Application Profile first,
+  // same as the Clients panel's own per-client apply does.
   const applyPreset = useCallback(
     async (preset: Preset) => {
-      await switchProfile(preset.profileId);
-      await applyActivity(primaryClientId, preset.payload);
+      const targets = clients.filter((c) => c.state === "connected" && !isExcluded(c, assignmentsApi.assignments));
+      await Promise.allSettled(targets.map((c) => applyPresetToClient(c.id, preset, profilesApi.profiles)));
     },
-    [switchProfile, primaryClientId],
+    [clients, assignmentsApi.assignments, profilesApi.profiles],
   );
 
   const rotationApi = useRotation(presetsApi.presets, applyPreset);
@@ -94,12 +114,17 @@ function App() {
   }
 
   async function handleStart() {
-    if (pending) return;
+    if (pending || applicableClients.length === 0) return;
     setPending(true);
     setError(null);
     try {
-      await applyActivity(primaryClientId, draft);
-      setApplied(draft);
+      const results = await Promise.allSettled(applicableClients.map((c) => applyActivity(c.id, draft)));
+      const failed = results.filter((r) => r.status === "rejected").length;
+      if (failed > 0) {
+        setError(`Failed to apply to ${failed} of ${applicableClients.length} clients`);
+      } else {
+        setApplied(draft);
+      }
     } catch (err) {
       setError(`Failed to apply: ${String(err)}`);
     } finally {
@@ -107,12 +132,16 @@ function App() {
     }
   }
 
+  // Stops every connected client outright, regardless of its None setting,
+  // and stops rotation too, so Stop always means "nothing is showing".
   async function handleStop() {
     if (pending) return;
     setPending(true);
     setError(null);
     try {
-      await clearActivity(primaryClientId);
+      if (rotationApi.running) rotationApi.setRunning(false);
+      const connected = clients.filter((c) => c.state === "connected");
+      await Promise.allSettled(connected.map((c) => clearActivity(c.id)));
       setApplied(null);
     } catch (err) {
       setError(`Failed to clear: ${String(err)}`);
@@ -146,6 +175,7 @@ function App() {
     if (autoStarted.current) return;
     if (!settingsApi.settings.startPresenceAutomatically) return;
     if (primaryStatus?.state !== "connected") return;
+    if (isExcluded(primaryStatus, assignmentsApi.assignments)) return;
     const first = presetsApi.presets[0];
     if (!first) return;
 
@@ -160,7 +190,14 @@ function App() {
         // Best-effort: the user can still start manually from the editor.
       }
     })();
-  }, [settingsApi.settings.startPresenceAutomatically, primaryStatus?.state, primaryClientId, presetsApi.presets, switchProfile]);
+  }, [
+    settingsApi.settings.startPresenceAutomatically,
+    primaryStatus,
+    assignmentsApi.assignments,
+    primaryClientId,
+    presetsApi.presets,
+    switchProfile,
+  ]);
 
   return (
     <div className="flex h-screen flex-col text-neutral-100 light:text-neutral-900">
@@ -186,13 +223,10 @@ function App() {
 
         <div className="flex items-center gap-3">
           {unsaved && <span className="text-xs text-amber-400">Unsaved changes</span>}
-          {rotationApi.running && <span className="text-xs text-indigo-400">Rotation running</span>}
+          {rotationApi.running && <span className="text-xs text-indigo-400">Rotation Running</span>}
           <div className="flex items-center gap-2 rounded-full border border-neutral-800 bg-neutral-900 px-3 py-1.5 light:border-neutral-200 light:bg-white">
-            <span className={`h-2 w-2 rounded-full ${STATUS_DOT[primaryStatus?.state ?? "disconnected"]}`} />
-            <span className="text-xs text-neutral-300 light:text-neutral-600">
-              {STATUS_LABEL[primaryStatus?.state ?? "disconnected"]}
-              {clients.length > 1 && ` · ${clients.length} clients`}
-            </span>
+            <span className={`h-2 w-2 rounded-full ${STATUS_DOT[pillState]}`} />
+            <span className="text-xs text-neutral-300 light:text-neutral-600">{pillLabel}</span>
           </div>
           <button
             onClick={handleStart}
@@ -203,7 +237,7 @@ function App() {
           </button>
           <button
             onClick={handleStop}
-            disabled={!isActive || pending}
+            disabled={pending || connectedCount === 0}
             className="rounded-lg border border-neutral-700 px-4 py-1.5 text-sm font-medium text-neutral-200 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:text-neutral-600 light:border-neutral-300 light:text-neutral-700 light:hover:bg-neutral-100 light:disabled:text-neutral-400"
           >
             Stop

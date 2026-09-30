@@ -25,8 +25,8 @@ export function AboutView() {
         <p className="text-xs text-neutral-500">
           Glint never asks for your Discord account token, never talks to the Discord HTTP API, and sends no
           analytics or telemetry anywhere. Presence goes only through Discord's official local IPC to the Discord
-          desktop app running on your machine. Everything else — profiles, presets, settings — stays in a file on
-          your computer.
+          desktop app running on your machine. Everything else, including your profiles, presets, and settings,
+          stays in a file on your computer.
         </p>
       </SectionCard>
     </div>

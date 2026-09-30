@@ -158,17 +158,24 @@ impl AppState {
             .map(|handle| handle.commands.clone())
     }
 
+    /// Every currently known client's command sender, used to clear every
+    /// client at once (the tray's "Stop presence" item), rather than just
+    /// the primary one.
+    pub(crate) fn all_command_senders(&self) -> Vec<Sender<ConnectionCommand>> {
+        self.clients
+            .lock()
+            .expect("clients mutex poisoned")
+            .values()
+            .map(|handle| handle.commands.clone())
+            .collect()
+    }
+
     /// Best effort shutdown of every client's worker. Fire and forget, same
     /// as the single client version always was: there's no waiting for the
     /// clear to actually finish before the process exits.
     pub fn shutdown_all(&self) {
-        for handle in self
-            .clients
-            .lock()
-            .expect("clients mutex poisoned")
-            .values()
-        {
-            let _ = handle.commands.send(ConnectionCommand::Shutdown);
+        for commands in self.all_command_senders() {
+            let _ = commands.send(ConnectionCommand::Shutdown);
         }
     }
 }
