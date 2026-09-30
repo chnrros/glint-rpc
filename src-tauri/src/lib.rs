@@ -4,7 +4,7 @@ mod presence;
 mod state;
 mod tray;
 
-use state::{AppState, ConnectionCommand};
+use state::AppState;
 use tauri::Manager;
 
 /// Glint's own Discord application, used until the user sets up an
@@ -61,7 +61,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::get_connection_status,
+            commands::get_clients,
             commands::apply_activity,
             commands::clear_activity,
             commands::set_application_id,
@@ -71,11 +71,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // Clear the presence and stop the worker thread on quit, so we
-            // never leave a stale activity showing after the app exits.
+            // Clear the presence and stop every client's worker thread on
+            // quit, so we never leave a stale activity showing after the
+            // app exits.
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app_handle.try_state::<AppState>() {
-                    let _ = state.commands.send(ConnectionCommand::Shutdown);
+                    state.shutdown_all();
                 }
             }
         });

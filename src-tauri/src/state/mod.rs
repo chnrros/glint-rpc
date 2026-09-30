@@ -1,11 +1,19 @@
-//! Owns the Discord connection on a dedicated background thread.
+//! Owns one Discord connection per locally running Discord client, each on
+//! its own background thread.
 //!
 //! `discord-rich-presence`'s client is blocking and not `Sync`, so it can't
 //! sit behind a plain `Mutex` shared with async command handlers without
-//! risking a command blocking the whole app on a stalled socket read. Instead
-//! the connection lives entirely on one thread; commands talk to it over a
-//! channel and read status from a `Mutex<ConnectionStatus>` the thread keeps
-//! updated.
+//! risking a command blocking the whole app on a stalled socket read.
+//! Instead each connection lives entirely on its own thread; commands
+//! target one client by id and talk to its thread over a channel, and read
+//! status from a `Mutex<ConnectionStatus>` that thread keeps updated.
+//!
+//! A separate supervisor thread scans for Discord clients (see
+//! `ipc::discover_clients`) every `SCAN_INTERVAL` and spawns a worker for
+//! any newly seen one. A client that quits isn't removed: its worker just
+//! keeps retrying and reports `Disconnected`, same as the single client
+//! case always did, so the UI doesn't lose a row the moment someone closes
+//! Discord PTB for a minute.
 //!
 //! Each command carries a one-shot reply channel so the calling Tauri
 //! command can return Discord's actual `Result` to the frontend, instead of
@@ -13,17 +21,18 @@
 //! the dev-mode log were easy to miss, including the party-size rejection
 //! this was built to catch.
 //!
-//! `SetActivity` is also rate-limited here (see `MIN_SEND_INTERVAL`):
+//! `SetActivity` is also rate-limited per client (see `MIN_SEND_INTERVAL`):
 //! Discord allows roughly 5 presence updates per 20 seconds, and a burst of
 //! several updates in quick succession (several concurrent frontend calls
 //! in flight at once, with nothing serializing them) silently gets
 //! throttled by Discord, leaving the profile showing stale data with no
 //! error surfaced anywhere. Rather than trust every caller to self-limit,
-//! the worker coalesces: at most one send per `MIN_SEND_INTERVAL`, and if
+//! each worker coalesces: at most one send per `MIN_SEND_INTERVAL`, and if
 //! more `SetActivity` commands arrive before the cooldown clears, only the
 //! latest one is actually sent: earlier superseded ones resolve `Ok(())`
 //! immediately rather than blocking their caller.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,7 +40,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-use crate::ipc::{DiscordConnection, IpcError};
+use crate::ipc::{ClientId, DiscordConnection, IpcError};
 use crate::presence::PresencePayload;
 
 /// How long to block waiting for a command when idle and connected.
@@ -46,6 +55,9 @@ const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(5);
 /// soon as a connection succeeds. Keeps retries from hammering a Discord
 /// that's genuinely not running, without ever giving up.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How often the supervisor thread checks for newly started Discord
+/// clients that don't have a worker yet.
+const SCAN_INTERVAL: Duration = Duration::from_secs(3);
 
 pub type Reply = Sender<Result<(), String>>;
 
@@ -55,6 +67,15 @@ pub enum ConnectionStatus {
     Disconnected,
     Connecting,
     Connected { username: Option<String> },
+}
+
+/// One entry in the client list the frontend shows in its "Clients"
+/// section: which `discord-ipc-N` slot this is, and its current status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientStatus {
+    pub id: ClientId,
+    #[serde(flatten)]
+    pub status: ConnectionStatus,
 }
 
 pub enum ConnectionCommand {
@@ -68,9 +89,13 @@ pub enum ConnectionCommand {
     Shutdown,
 }
 
+struct ClientHandle {
+    status: Arc<Mutex<ConnectionStatus>>,
+    commands: Sender<ConnectionCommand>,
+}
+
 pub struct AppState {
-    pub status: Arc<Mutex<ConnectionStatus>>,
-    pub commands: Sender<ConnectionCommand>,
+    clients: Arc<Mutex<HashMap<ClientId, ClientHandle>>>,
     /// Presets the frontend has synced for the tray menu. Rust has no
     /// other knowledge of them. See `tray::rebuild_menu`.
     pub tray_presets: Arc<Mutex<Vec<crate::tray::TrayPreset>>>,
@@ -81,26 +106,109 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn spawn(app_handle: AppHandle, app_id: String) -> Self {
-        let status = Arc::new(Mutex::new(ConnectionStatus::Disconnected));
-        let (tx, rx) = std::sync::mpsc::channel();
+    pub fn spawn(app_handle: AppHandle, default_app_id: String) -> Self {
+        let clients: Arc<Mutex<HashMap<ClientId, ClientHandle>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
-        let worker_status = status.clone();
-        std::thread::spawn(move || run_worker(app_handle, app_id, worker_status, rx));
+        let supervisor_clients = clients.clone();
+        std::thread::spawn(move || run_supervisor(app_handle, default_app_id, supervisor_clients));
 
         Self {
-            status,
-            commands: tx,
+            clients,
             tray_presets: Arc::new(Mutex::new(Vec::new())),
             minimize_to_tray: Arc::new(Mutex::new(true)),
         }
     }
 
-    pub fn snapshot(&self) -> ConnectionStatus {
-        self.status
+    pub fn snapshot(&self) -> Vec<ClientStatus> {
+        let mut clients: Vec<ClientStatus> = self
+            .clients
             .lock()
-            .expect("connection status mutex poisoned")
-            .clone()
+            .expect("clients mutex poisoned")
+            .iter()
+            .map(|(id, handle)| ClientStatus {
+                id: *id,
+                status: handle
+                    .status
+                    .lock()
+                    .expect("connection status mutex poisoned")
+                    .clone(),
+            })
+            .collect();
+        clients.sort_by_key(|c| c.id);
+        clients
+    }
+
+    pub(crate) fn command_sender(&self, id: ClientId) -> Option<Sender<ConnectionCommand>> {
+        self.clients
+            .lock()
+            .expect("clients mutex poisoned")
+            .get(&id)
+            .map(|handle| handle.commands.clone())
+    }
+
+    /// The sender for the lowest numbered known client, used by the tray
+    /// menu, which has no concept of picking a specific client.
+    pub(crate) fn primary_command_sender(&self) -> Option<Sender<ConnectionCommand>> {
+        let clients = self.clients.lock().expect("clients mutex poisoned");
+        clients
+            .keys()
+            .min()
+            .and_then(|id| clients.get(id))
+            .map(|handle| handle.commands.clone())
+    }
+
+    /// Best effort shutdown of every client's worker. Fire and forget, same
+    /// as the single client version always was: there's no waiting for the
+    /// clear to actually finish before the process exits.
+    pub fn shutdown_all(&self) {
+        for handle in self
+            .clients
+            .lock()
+            .expect("clients mutex poisoned")
+            .values()
+        {
+            let _ = handle.commands.send(ConnectionCommand::Shutdown);
+        }
+    }
+}
+
+/// Watches for Discord clients appearing and spawns a worker thread for
+/// each one that doesn't already have one. Never removes an entry: a
+/// client that quits just sits `Disconnected` in its own worker, same as
+/// before multiple clients were supported.
+fn run_supervisor(
+    app_handle: AppHandle,
+    default_app_id: String,
+    clients: Arc<Mutex<HashMap<ClientId, ClientHandle>>>,
+) {
+    loop {
+        for id in crate::ipc::discover_clients() {
+            let mut clients = clients.lock().expect("clients mutex poisoned");
+            if clients.contains_key(&id) {
+                continue;
+            }
+
+            let status = Arc::new(Mutex::new(ConnectionStatus::Disconnected));
+            let (tx, rx) = std::sync::mpsc::channel();
+
+            let worker_app_handle = app_handle.clone();
+            let worker_app_id = default_app_id.clone();
+            let worker_status = status.clone();
+            std::thread::spawn(move || {
+                run_worker(worker_app_handle, id, worker_app_id, worker_status, rx)
+            });
+
+            clients.insert(
+                id,
+                ClientHandle {
+                    status,
+                    commands: tx,
+                },
+            );
+        }
+
+        std::thread::sleep(SCAN_INTERVAL);
     }
 }
 
@@ -116,6 +224,7 @@ type Pending = (Box<PresencePayload>, Reply);
 
 fn run_worker(
     app_handle: AppHandle,
+    id: ClientId,
     mut app_id: String,
     status: Arc<Mutex<ConnectionStatus>>,
     commands: Receiver<ConnectionCommand>,
@@ -128,13 +237,14 @@ fn run_worker(
 
     loop {
         if connection.is_none() {
-            set_status(&app_handle, &status, ConnectionStatus::Connecting);
+            set_status(&app_handle, id, &status, ConnectionStatus::Connecting);
 
-            let mut candidate = DiscordConnection::new(&app_id);
+            let mut candidate = DiscordConnection::new(id, &app_id);
             match candidate.connect() {
                 Ok(handshake) => {
                     set_status(
                         &app_handle,
+                        id,
                         &status,
                         ConnectionStatus::Connected {
                             username: handshake.username,
@@ -144,7 +254,7 @@ fn run_worker(
                     reconnect_backoff = RECONNECT_BACKOFF_BASE;
                 }
                 Err(_) => {
-                    set_status(&app_handle, &status, ConnectionStatus::Disconnected);
+                    set_status(&app_handle, id, &status, ConnectionStatus::Disconnected);
                     if let Ok(ConnectionCommand::Shutdown) =
                         commands.recv_timeout(reconnect_backoff)
                     {
@@ -165,6 +275,7 @@ fn run_worker(
                 }
                 flush_if_due(
                     &app_handle,
+                    id,
                     &status,
                     &mut connection,
                     &mut pending,
@@ -182,7 +293,7 @@ fn run_worker(
                 };
                 last_sent_at = Some(Instant::now());
                 last_activity = None;
-                handle_result(&app_handle, &status, &mut connection, result, reply);
+                handle_result(&app_handle, id, &status, &mut connection, result, reply);
             }
             Ok(ConnectionCommand::SetApplicationId(new_id)) => {
                 if new_id != app_id {
@@ -193,7 +304,7 @@ fn run_worker(
                     if let Some(mut conn) = connection.take() {
                         conn.close();
                     }
-                    set_status(&app_handle, &status, ConnectionStatus::Connecting);
+                    set_status(&app_handle, id, &status, ConnectionStatus::Connecting);
                 }
             }
             Ok(ConnectionCommand::Shutdown) => {
@@ -206,6 +317,7 @@ fn run_worker(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 flush_if_due(
                     &app_handle,
+                    id,
                     &status,
                     &mut connection,
                     &mut pending,
@@ -231,8 +343,10 @@ fn next_wait(pending: &Option<Pending>, last_sent_at: Option<Instant>) -> Durati
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_if_due(
     app_handle: &AppHandle,
+    id: ClientId,
     status: &Arc<Mutex<ConnectionStatus>>,
     connection: &mut Option<DiscordConnection>,
     pending: &mut Option<Pending>,
@@ -254,7 +368,7 @@ fn flush_if_due(
     if last_activity.as_ref() == Some(payload.as_ref()) {
         #[cfg(debug_assertions)]
         eprintln!(
-            "[glint {}] skipping SetActivity: identical to last send",
+            "[glint {} client {id}] skipping SetActivity: identical to last send",
             crate::ipc::log_ts()
         );
         let _ = reply.send(Ok(()));
@@ -269,11 +383,12 @@ fn flush_if_due(
     if result.is_ok() {
         *last_activity = Some(*payload.clone());
     }
-    handle_result(app_handle, status, connection, result, reply);
+    handle_result(app_handle, id, status, connection, result, reply);
 }
 
 fn handle_result(
     app_handle: &AppHandle,
+    id: ClientId,
     status: &Arc<Mutex<ConnectionStatus>>,
     connection: &mut Option<DiscordConnection>,
     result: Result<(), IpcError>,
@@ -282,7 +397,7 @@ fn handle_result(
     if let Err(err) = &result {
         if is_connection_fatal(err) {
             *connection = None;
-            set_status(app_handle, status, ConnectionStatus::Disconnected);
+            set_status(app_handle, id, status, ConnectionStatus::Disconnected);
         }
     }
     let _ = reply.send(result.map_err(|e| e.to_string()));
@@ -290,9 +405,16 @@ fn handle_result(
 
 fn set_status(
     app_handle: &AppHandle,
+    id: ClientId,
     status: &Arc<Mutex<ConnectionStatus>>,
     new_status: ConnectionStatus,
 ) {
     *status.lock().expect("connection status mutex poisoned") = new_status.clone();
-    let _ = app_handle.emit("connection-status", new_status);
+    let _ = app_handle.emit(
+        "connection-status",
+        ClientStatus {
+            id,
+            status: new_status,
+        },
+    );
 }

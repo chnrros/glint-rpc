@@ -1,27 +1,37 @@
-//! Thin wrapper around `discord-rich-presence`'s IPC client.
+//! Raw Discord IPC transport, one connection per local Discord client.
 //!
-//! Handshake capture is done manually (instead of via `DiscordIpc::connect`)
-//! because the crate's own handshake helper reads and discards the READY
-//! response, which is the only place Discord returns the connected username.
+//! Discord Stable, PTB, and Canary each claim their own
+//! `discord-ipc-0` through `discord-ipc-9` socket (Unix) or named pipe
+//! (Windows) when they start, picking the first free slot. The
+//! `discord-rich-presence` crate's own client always connects to whichever
+//! slot it finds first, with no way to target a specific one, so it can
+//! only ever reach a single running client. This module reimplements the
+//! same small protocol (the crate's own send/recv framing, an 8 byte
+//! header of little endian opcode and length, then the JSON body) against
+//! a socket we open ourselves at a chosen slot, so Glint can hold one
+//! connection per detected client at once. `discord_rich_presence` is
+//! still used for the `Activity` payload type (see `presence/mod.rs`).
 //!
 //! Every SET_ACTIVITY-shaped send (`set_activity`, `clear_activity`) goes
 //! through one path that builds its own envelope with a nonce we generate
 //! and control, then reads frames until one with that nonce comes back.
-//! Two real bugs made that necessary:
-//!
-//! - The crate's own `DiscordIpc::set_activity`/`clear_activity` only send
-//!   (they never read Discord's reply), so a payload Discord silently
-//!   rejected (`"evt": "ERROR"`) looked identical to success.
-//! - `clear_activity` used to go through the crate's method with no read at
-//!   all, leaving its response frame permanently unread on the socket. The
-//!   next call's naive "next frame must be mine" read then consumed *that*
-//!   stale frame instead of its own, permanently shifting every reply one
-//!   send out of phase with its request for the rest of the session.
+//! Reading blindly (assuming the very next frame is always the reply) once
+//! caused a real bug: `clear_activity` used to leave its response frame
+//! unread on the socket, so every read after that was one frame behind for
+//! the rest of the session.
 
-use discord_rich_presence::{activity::Activity, DiscordIpc, DiscordIpcClient};
+use discord_rich_presence::activity::Activity;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Which local Discord client a connection targets: the slot number from
+/// its `discord-ipc-N` socket or pipe, 0 through 9.
+pub type ClientId = u8;
+
+/// How many slots Discord will use. Matches the crate's own search range.
+const MAX_CLIENTS: ClientId = 10;
 
 /// Seconds elapsed since this process started, to one decimal place. Lets
 /// debug log lines be correlated by spacing (e.g. "were these really 20s
@@ -59,9 +69,77 @@ pub struct Handshake {
     pub username: Option<String>,
 }
 
-pub struct DiscordConnection {
-    client: DiscordIpcClient,
-    app_id: String,
+#[cfg(unix)]
+type PlatformSocket = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type PlatformSocket = std::fs::File;
+
+/// Opens a connection to the `discord-ipc-{id}` slot, or `None` if nothing
+/// is listening there.
+#[cfg(unix)]
+fn connect_socket(id: ClientId) -> Option<PlatformSocket> {
+    // Discord (and Vesktop, Flatpak and Snap builds of it) creates its
+    // socket under one of these base directories, sometimes nested in a
+    // build specific subfolder. Ported from `discord-rich-presence`'s own
+    // `find_pipe`, minus its Snap specific `SNAP` env var rewrite, which
+    // isn't needed to find the socket, only to match Snap's own reported
+    // path exactly.
+    const ENV_KEYS: [&str; 4] = ["XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"];
+    const APP_SUBPATHS: [&str; 7] = [
+        "",
+        "app/com.discordapp.Discord/",
+        "app/dev.vencord.Vesktop/",
+        ".flatpak/com.discordapp.Discord/xdg-run/",
+        ".flatpak/dev.vencord.Vesktop/xdg-run/",
+        "snap.discord-canary/",
+        "snap.discord/",
+    ];
+
+    let pipe_name = format!("discord-ipc-{id}");
+    for key in ENV_KEYS {
+        let Ok(base) = std::env::var(key) else {
+            continue;
+        };
+        let base = std::path::PathBuf::from(base);
+        if !base.is_dir() {
+            continue;
+        }
+        for subpath in APP_SUBPATHS {
+            let path = base.join(subpath).join(&pipe_name);
+            if let Ok(socket) = PlatformSocket::connect(&path) {
+                return Some(socket);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn connect_socket(id: ClientId) -> Option<PlatformSocket> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let path = format!(r"\\?\pipe\discord-ipc-{id}");
+    // access_mode(0x3) is GENERIC_READ | GENERIC_WRITE, matching how
+    // `discord-rich-presence` opens the same named pipe.
+    OpenOptions::new().access_mode(0x3).open(path).ok()
+}
+
+/// Detects every locally running Discord client by probing each
+/// `discord-ipc-N` slot for a live socket or pipe, then immediately
+/// closing the probe connection. Connecting and disconnecting like this is
+/// harmless: it's the same thing any IPC client does before a real
+/// handshake, and Discord doesn't treat it as an error.
+pub fn discover_clients() -> Vec<ClientId> {
+    (0..MAX_CLIENTS)
+        .filter(|&id| connect_socket(id).is_some())
+        .collect()
+}
+
+fn next_nonce() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("glint-{}-{n}", std::process::id())
 }
 
 /// How many unrelated frames we'll skip past while looking for our nonce
@@ -70,34 +148,29 @@ pub struct DiscordConnection {
 /// forever.
 const MAX_ACK_ATTEMPTS: u32 = 8;
 
-fn next_nonce() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("glint-{}-{n}", std::process::id())
+pub struct DiscordConnection {
+    client_id: ClientId,
+    app_id: String,
+    socket: Option<PlatformSocket>,
 }
 
 impl DiscordConnection {
-    pub fn new(app_id: impl Into<String>) -> Self {
-        let app_id = app_id.into();
+    pub fn new(client_id: ClientId, app_id: impl Into<String>) -> Self {
         Self {
-            client: DiscordIpcClient::new(&app_id),
-            app_id,
+            client_id,
+            app_id: app_id.into(),
+            socket: None,
         }
     }
 
     pub fn connect(&mut self) -> Result<Handshake, IpcError> {
-        self.client
-            .connect_ipc()
-            .map_err(|_| IpcError::NotRunning)?;
+        let socket = connect_socket(self.client_id).ok_or(IpcError::NotRunning)?;
+        self.socket = Some(socket);
 
-        self.client
-            .send(json!({ "v": 1, "client_id": self.app_id }), 0)
-            .map_err(|e| IpcError::Handshake(e.to_string()))?;
+        self.send(json!({ "v": 1, "client_id": self.app_id }), 0)
+            .map_err(IpcError::Handshake)?;
 
-        let (_, response) = self
-            .client
-            .recv()
-            .map_err(|e| IpcError::Handshake(e.to_string()))?;
+        let (_, response) = self.recv().map_err(IpcError::Handshake)?;
 
         let username = response
             .get("data")
@@ -119,7 +192,12 @@ impl DiscordConnection {
     }
 
     pub fn close(&mut self) {
-        let _ = self.client.close();
+        let _ = self.send(json!({}), 2);
+        #[cfg(unix)]
+        if let Some(socket) = self.socket.as_ref() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        self.socket = None;
     }
 
     /// Builds and sends one SET_ACTIVITY envelope with a nonce we generate
@@ -130,21 +208,21 @@ impl DiscordConnection {
 
         #[cfg(debug_assertions)]
         eprintln!(
-            "[glint {}] SET_ACTIVITY payload (nonce {nonce}):\n{}",
+            "[glint {} client {}] SET_ACTIVITY payload (nonce {nonce}):\n{}",
             log_ts(),
+            self.client_id,
             serde_json::to_string_pretty(&activity).unwrap_or_default()
         );
 
-        self.client
-            .send(
-                json!({
-                    "cmd": "SET_ACTIVITY",
-                    "args": { "pid": std::process::id(), "activity": activity },
-                    "nonce": nonce,
-                }),
-                1,
-            )
-            .map_err(|e| IpcError::Send(e.to_string()))?;
+        self.send(
+            json!({
+                "cmd": "SET_ACTIVITY",
+                "args": { "pid": std::process::id(), "activity": activity },
+                "nonce": nonce,
+            }),
+            1,
+        )
+        .map_err(IpcError::Send)?;
 
         self.read_ack(&nonce)
     }
@@ -156,24 +234,23 @@ impl DiscordConnection {
     /// that assumption broke things.
     fn read_ack(&mut self, expected_nonce: &str) -> Result<(), IpcError> {
         for _ in 0..MAX_ACK_ATTEMPTS {
-            let (_, response) = self
-                .client
-                .recv()
-                .map_err(|e| IpcError::Send(e.to_string()))?;
+            let (_, response) = self.recv().map_err(IpcError::Send)?;
 
             if response.get("nonce").and_then(Value::as_str) != Some(expected_nonce) {
                 #[cfg(debug_assertions)]
                 eprintln!(
-                    "[glint {}] skipping frame with unexpected nonce:\n{response:#}",
-                    log_ts()
+                    "[glint {} client {}] skipping frame with unexpected nonce:\n{response:#}",
+                    log_ts(),
+                    self.client_id
                 );
                 continue;
             }
 
             #[cfg(debug_assertions)]
             eprintln!(
-                "[glint {}] Discord response (nonce {expected_nonce}):\n{}",
+                "[glint {} client {}] Discord response (nonce {expected_nonce}):\n{}",
                 log_ts(),
+                self.client_id,
                 serde_json::to_string_pretty(&response).unwrap_or_default()
             );
 
@@ -193,5 +270,36 @@ impl DiscordConnection {
         Err(IpcError::Send(format!(
             "no reply with nonce {expected_nonce} after {MAX_ACK_ATTEMPTS} frames"
         )))
+    }
+
+    fn send(&mut self, data: Value, opcode: u32) -> Result<(), String> {
+        let socket = self.socket.as_mut().ok_or("not connected")?;
+        let body = data.to_string();
+        let mut header = [0u8; 8];
+        header[0..4].copy_from_slice(&opcode.to_le_bytes());
+        header[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        socket.write_all(&header).map_err(|e| e.to_string())?;
+        socket
+            .write_all(body.as_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn recv(&mut self) -> Result<(u32, Value), String> {
+        let socket = self.socket.as_mut().ok_or("not connected")?;
+
+        let mut header = [0u8; 8];
+        socket.read_exact(&mut header).map_err(|e| e.to_string())?;
+        let opcode = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+
+        let mut body = vec![0u8; length as usize];
+        socket.read_exact(&mut body).map_err(|e| e.to_string())?;
+
+        let text = String::from_utf8(body).map_err(|_| "Discord sent non-UTF8 data".to_string())?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|_| "Discord sent invalid JSON".to_string())?;
+
+        Ok((opcode, value))
     }
 }

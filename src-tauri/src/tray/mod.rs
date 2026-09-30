@@ -116,14 +116,18 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         "quit" => app.exit(0),
         "stop" => {
+            let Some(commands) = state.primary_command_sender() else {
+                return;
+            };
             let (reply_tx, _reply_rx) = mpsc::channel();
-            let _ = state
-                .commands
-                .send(ConnectionCommand::ClearActivity(reply_tx));
+            let _ = commands.send(ConnectionCommand::ClearActivity(reply_tx));
         }
         "no_presets" => {}
         id => {
             let Some(preset_id) = id.strip_prefix("preset:") else {
+                return;
+            };
+            let Some(commands) = state.primary_command_sender() else {
                 return;
             };
             let presets = state
@@ -132,10 +136,8 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 .expect("tray presets mutex poisoned");
             if let Some(preset) = presets.iter().find(|p| p.id == preset_id) {
                 let (reply_tx, _reply_rx) = mpsc::channel();
-                let _ = state
-                    .commands
-                    .send(ConnectionCommand::SetApplicationId(preset.app_id.clone()));
-                let _ = state.commands.send(ConnectionCommand::SetActivity(
+                let _ = commands.send(ConnectionCommand::SetApplicationId(preset.app_id.clone()));
+                let _ = commands.send(ConnectionCommand::SetActivity(
                     Box::new(preset.payload.clone()),
                     reply_tx,
                 ));

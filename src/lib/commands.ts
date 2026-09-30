@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ConnectionStatus } from "../types/connection";
+import type { ClientStatus } from "../types/connection";
 import type { PresencePayload } from "../types/presence";
 
 // Mirrors src-tauri/src/tray/mod.rs::TrayPreset
@@ -10,20 +10,20 @@ export interface TrayPreset {
   payload: PresencePayload;
 }
 
-export function getConnectionStatus(): Promise<ConnectionStatus> {
-  return invoke("get_connection_status");
+export function getClients(): Promise<ClientStatus[]> {
+  return invoke("get_clients");
 }
 
-export function applyActivity(payload: PresencePayload): Promise<void> {
-  return invoke("apply_activity", { payload });
+export function applyActivity(clientId: number, payload: PresencePayload): Promise<void> {
+  return invoke("apply_activity", { clientId, payload });
 }
 
-export function clearActivity(): Promise<void> {
-  return invoke("clear_activity");
+export function clearActivity(clientId: number): Promise<void> {
+  return invoke("clear_activity", { clientId });
 }
 
-export function setApplicationId(appId: string): Promise<void> {
-  return invoke("set_application_id", { appId });
+export function setApplicationId(clientId: number, appId: string): Promise<void> {
+  return invoke("set_application_id", { clientId, appId });
 }
 
 export function syncTrayPresets(presets: TrayPreset[]): Promise<void> {

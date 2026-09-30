@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useConnectionStatus } from "./hooks/useConnectionStatus";
+import { useClients } from "./hooks/useClients";
 import {
   applyActivity,
   clearActivity,
-  getConnectionStatus,
+  getClients,
   setApplicationId,
   setMinimizeToTrayOnClose,
   syncTrayPresets,
 } from "./lib/commands";
+import { STATUS_DOT, STATUS_LABEL } from "./lib/connectionStatus";
 import { EditorView } from "./features/editor/EditorView";
 import { PresetsView } from "./features/presets/PresetsView";
 import { SettingsView } from "./features/settings/SettingsView";
@@ -26,20 +27,15 @@ import { hasErrors, validatePresence } from "./lib/validation";
 const APP_NAME = "Glint";
 const PROFILE_SWITCH_TIMEOUT_MS = 8000;
 
-const STATUS_LABEL: Record<string, string> = {
-  disconnected: "Discord not running",
-  connecting: "Reconnecting…",
-  connected: "Connected",
-};
-
-const STATUS_DOT: Record<string, string> = {
-  disconnected: "bg-red-500",
-  connecting: "bg-amber-400",
-  connected: "bg-emerald-500",
-};
-
 function App() {
-  const status = useConnectionStatus();
+  const clients = useClients();
+  // The editor's own Start/Update/Stop always targets the first detected
+  // Discord client, same as Glint did back when it only supported one.
+  // Additional clients are handled by the Clients panel on the Presets
+  // tab, which applies a preset to a specific client (or all of them)
+  // directly, instead of going through this shared draft.
+  const primaryClientId = clients[0]?.id ?? 0;
+  const primaryStatus = clients.find((c) => c.id === primaryClientId);
   const [tab, setTab] = useState<Tab>("editor");
   const [draft, setDraft] = useState<PresencePayload>(EMPTY_PRESENCE);
   const [applied, setApplied] = useState<PresencePayload | null>(null);
@@ -59,35 +55,35 @@ function App() {
   const errors = validatePresence(draft);
   const isActive = applied !== null;
   const unsaved = isActive && JSON.stringify(draft) !== JSON.stringify(applied);
-  const canApply = status.state === "connected" && !hasErrors(errors);
+  const canApply = primaryStatus?.state === "connected" && !hasErrors(errors);
 
-  /** Switches the connection to `profileId`'s Application ID and waits for
-   * it to reconnect, if it isn't already the active one. */
+  /** Switches the primary client's connection to `profileId`'s Application
+   * ID and waits for it to reconnect, if it isn't already the active one. */
   const switchProfile = useCallback(
     async (profileId: string) => {
       if (profileId === activeProfileId) return;
       const profile = profilesApi.profiles.find((p) => p.id === profileId);
       if (!profile) return;
 
-      await setApplicationId(profile.appId);
+      await setApplicationId(primaryClientId, profile.appId);
       setActiveProfileId(profileId);
 
       const deadline = Date.now() + PROFILE_SWITCH_TIMEOUT_MS;
       while (Date.now() < deadline) {
-        const latest = await getConnectionStatus();
-        if (latest.state === "connected") return;
+        const latest = await getClients();
+        if (latest.find((c) => c.id === primaryClientId)?.state === "connected") return;
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
     },
-    [activeProfileId, profilesApi.profiles],
+    [activeProfileId, primaryClientId, profilesApi.profiles],
   );
 
   const applyPreset = useCallback(
     async (preset: Preset) => {
       await switchProfile(preset.profileId);
-      await applyActivity(preset.payload);
+      await applyActivity(primaryClientId, preset.payload);
     },
-    [switchProfile],
+    [switchProfile, primaryClientId],
   );
 
   const rotationApi = useRotation(presetsApi.presets, applyPreset);
@@ -102,7 +98,7 @@ function App() {
     setPending(true);
     setError(null);
     try {
-      await applyActivity(draft);
+      await applyActivity(primaryClientId, draft);
       setApplied(draft);
     } catch (err) {
       setError(`Failed to apply: ${String(err)}`);
@@ -116,7 +112,7 @@ function App() {
     setPending(true);
     setError(null);
     try {
-      await clearActivity();
+      await clearActivity(primaryClientId);
       setApplied(null);
     } catch (err) {
       setError(`Failed to clear: ${String(err)}`);
@@ -149,7 +145,7 @@ function App() {
   useEffect(() => {
     if (autoStarted.current) return;
     if (!settingsApi.settings.startPresenceAutomatically) return;
-    if (status.state !== "connected") return;
+    if (primaryStatus?.state !== "connected") return;
     const first = presetsApi.presets[0];
     if (!first) return;
 
@@ -157,14 +153,14 @@ function App() {
     void (async () => {
       await switchProfile(first.profileId);
       try {
-        await applyActivity(first.payload);
+        await applyActivity(primaryClientId, first.payload);
         setDraft(first.payload);
         setApplied(first.payload);
       } catch {
         // Best-effort: the user can still start manually from the editor.
       }
     })();
-  }, [settingsApi.settings.startPresenceAutomatically, status.state, presetsApi.presets, switchProfile]);
+  }, [settingsApi.settings.startPresenceAutomatically, primaryStatus?.state, primaryClientId, presetsApi.presets, switchProfile]);
 
   return (
     <div className="flex h-screen flex-col text-neutral-100 light:text-neutral-900">
@@ -192,8 +188,11 @@ function App() {
           {unsaved && <span className="text-xs text-amber-400">Unsaved changes</span>}
           {rotationApi.running && <span className="text-xs text-indigo-400">Rotation running</span>}
           <div className="flex items-center gap-2 rounded-full border border-neutral-800 bg-neutral-900 px-3 py-1.5 light:border-neutral-200 light:bg-white">
-            <span className={`h-2 w-2 rounded-full ${STATUS_DOT[status.state]}`} />
-            <span className="text-xs text-neutral-300 light:text-neutral-600">{STATUS_LABEL[status.state]}</span>
+            <span className={`h-2 w-2 rounded-full ${STATUS_DOT[primaryStatus?.state ?? "disconnected"]}`} />
+            <span className="text-xs text-neutral-300 light:text-neutral-600">
+              {STATUS_LABEL[primaryStatus?.state ?? "disconnected"]}
+              {clients.length > 1 && ` · ${clients.length} clients`}
+            </span>
           </div>
           <button
             onClick={handleStart}
@@ -229,6 +228,7 @@ function App() {
               profilesApi={profilesApi}
               presetsApi={presetsApi}
               rotationApi={rotationApi}
+              clients={clients}
               draft={draft}
               activeProfileId={activeProfileId}
               onLoadPreset={handleLoadPreset}
