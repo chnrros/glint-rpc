@@ -5,8 +5,9 @@ Presence (the activity card on your profile), with a live preview, saved
 presets, rotation, and a system tray icon. No Discord account token, no
 tracking, everything stays on your machine.
 
-![Glint editor screenshot](docs/screenshot-editor.png)
-![Glint preview and tray screenshot](docs/screenshot-preview.png)
+![Glint editor screenshot](file:///var/folders/qr/423s63qx35sg_8q53gzwy4vm0000gn/T/TemporaryItems/NSIRD_screencaptureui_t5KIZs/Screenshot%202026-10-01%20at%209.11.34%E2%80%AFam.png![Uploading Screenshot 2026-10-01 at 9.15.10 am.png…]()
+)
+![Glint preview and tray screenshot](file:///Users/remiurquhart/Downloads/download)
 
 <!-- TODO: replace the two images above with real screenshots before your first release. -->
 
