@@ -93,6 +93,16 @@ shows "Glint". To show your own name instead:
    new profile with that ID, and pick it for any preset you want to use
    it.
 
+## Multiple accounts
+
+Glint talks to every Discord client running locally at once: Discord,
+Discord PTB, and Discord Canary, each with its own account if you're
+logged into them separately. Open the Presets tab and a Clients section
+appears once more than one client is running, listing each connected
+account with its own preset picker. Pick a different preset for each
+account, apply the same one to all of them, or set an account to None to
+keep its presence cleared no matter what else you do.
+
 ## Building from source
 
 Requirements: [Node.js](https://nodejs.org/) 20+, [Rust](https://rustup.rs/),

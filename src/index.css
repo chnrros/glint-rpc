@@ -101,3 +101,18 @@ body::after {
 .font-wordmark:hover {
   filter: drop-shadow(0 0 8px color-mix(in srgb, var(--wordmark-to) 65%, transparent));
 }
+
+/* Brief highlight for the Clients section after jumping to it from the
+   status pill, so it's clear where the page landed. */
+.clients-highlight {
+  animation: clients-highlight-pulse 1.5s ease-out;
+}
+
+@keyframes clients-highlight-pulse {
+  0% {
+    box-shadow: 0 0 0 2px var(--wordmark-to);
+  }
+  100% {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}

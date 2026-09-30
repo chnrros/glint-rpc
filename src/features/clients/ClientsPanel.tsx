@@ -108,7 +108,7 @@ export function ClientsPanel({ clients, presets, profiles, assignmentsApi }: Cli
   }
 
   return (
-    <SectionCard title="Clients">
+    <SectionCard id="clients-section" title="Clients">
       <p className="text-xs text-neutral-500">
         Every Discord client running locally, detected over local IPC. Pick what runs on each account below,
         or apply the same preset to all of them at once. Set an account to None to keep it cleared.

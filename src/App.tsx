@@ -54,6 +54,9 @@ function App() {
   const pillState = connectedCount > 0 ? "connected" : clients.some((c) => c.state === "connecting") ? "connecting" : "disconnected";
   const pillLabel = connectedCount >= 2 ? `Connected · ${connectedCount} Clients` : STATUS_LABEL[pillState];
   const [tab, setTab] = useState<Tab>("editor");
+  // Bumped on every status pill click, so clicking it again while already
+  // on the Presets tab still re-scrolls and re-highlights the section.
+  const [clientsScrollRequest, setClientsScrollRequest] = useState(0);
   const [draft, setDraft] = useState<PresencePayload>(EMPTY_PRESENCE);
   const [applied, setApplied] = useState<PresencePayload | null>(null);
   const [activeProfileId, setActiveProfileId] = useState(DEFAULT_PROFILE.id);
@@ -190,6 +193,20 @@ function App() {
     void syncExcludedClients(excluded);
   }, [clients, assignmentsApi.assignments]);
 
+  // Scrolls to and briefly highlights the Clients section after clicking
+  // the status pill. Runs after the Presets tab (and the section inside
+  // it) has actually rendered, since setTab and this both fire from the
+  // same click and land in the same commit.
+  useEffect(() => {
+    if (clientsScrollRequest === 0 || tab !== "presets") return;
+    const section = document.getElementById("clients-section");
+    if (!section) return;
+    section.scrollIntoView({ behavior: "smooth", block: "start" });
+    section.classList.add("clients-highlight");
+    const timeout = setTimeout(() => section.classList.remove("clients-highlight"), 1500);
+    return () => clearTimeout(timeout);
+  }, [clientsScrollRequest, tab]);
+
   // Apply the first saved preset once, as soon as Discord connects, if the
   // user opted in.
   const autoStarted = useRef(false);
@@ -246,10 +263,24 @@ function App() {
         <div className="flex items-center gap-3">
           {unsaved && <span className="text-xs text-amber-400">Unsaved changes</span>}
           {rotationApi.running && <span className="text-xs text-indigo-400">Rotation Running</span>}
-          <div className="flex items-center gap-2 rounded-full border border-neutral-800 bg-neutral-900 px-3 py-1.5 light:border-neutral-200 light:bg-white">
-            <span className={`h-2 w-2 rounded-full ${STATUS_DOT[pillState]}`} />
-            <span className="text-xs text-neutral-300 light:text-neutral-600">{pillLabel}</span>
-          </div>
+          {connectedCount >= 2 ? (
+            <button
+              onClick={() => {
+                setTab("presets");
+                setClientsScrollRequest((n) => n + 1);
+              }}
+              className="flex cursor-pointer items-center gap-2 rounded-full border border-neutral-800 bg-neutral-900 px-3 py-1.5 hover:bg-neutral-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 light:border-neutral-200 light:bg-white light:hover:bg-neutral-100"
+              title="Go to the Clients section"
+            >
+              <span className={`h-2 w-2 rounded-full ${STATUS_DOT[pillState]}`} />
+              <span className="text-xs text-neutral-300 light:text-neutral-600">{pillLabel}</span>
+            </button>
+          ) : (
+            <div className="flex items-center gap-2 rounded-full border border-neutral-800 bg-neutral-900 px-3 py-1.5 light:border-neutral-200 light:bg-white">
+              <span className={`h-2 w-2 rounded-full ${STATUS_DOT[pillState]}`} />
+              <span className="text-xs text-neutral-300 light:text-neutral-600">{pillLabel}</span>
+            </div>
+          )}
           <button
             onClick={handleStart}
             disabled={!canApply || pending}
